@@ -1,74 +1,38 @@
 #!/usr/bin/env python3
-"""The Funniest Office Joke, Judged Head to Head -- make.fun entry.
+"""One office joke, written to a file.
 
-Writes one line to ``$MAKEFUN_OUTPUT_DIR/entry.txt``: a single joke
-about office life, one short line, and that line is the entire entry.
+The whole entry is one line of text in ``entry.txt`` under the directory
+named by ``MAKEFUN_OUTPUT_DIR`` (``/output`` when that variable is empty
+or missing). The line jokes about office life by treating the fire
+drill as the perfect meeting: everyone turns up on time, everyone
+leaves together, and nobody asks for the slides. Each of the three
+beats is true of a drill and false of a genuine meeting, which is why
+the punchline can sit at the end.
 
-The program is deliberately boring on purpose: no randomness, no clock,
-no network, no third-party code -- Python 3.13 standard library only.
-Every run writes the exact same bytes, so the sealed scorer sees the
-same valid entry no matter who runs it or when.
+The program is intentionally dull: standard library only, no clock,
+no randomness, no network, no third-party code. Anybody running it
+anywhere gets byte-identical output, so the scorer always reads the
+same valid entry.
 
-The entry itself is a real joke with a setup and a turn. The setup
-names the one meeting nobody ever skips -- the fire drill -- and then
-escalates in three beats (everyone on time, everyone leaves together,
-nobody asks for the slides), each beat true of a fire drill and
-impossible of a real meeting. The punchline lands last, on the most
-recognisable office ritual of all: asking for the slides. Anyone who
-has worked in an office knows all three beats at once, which is what
-the judge's brief rewards.
+Three other lines were tried against the brief and dropped:
 
-Three alternatives were compared against the judge's brief and lost:
+* A printer line (110ch) that only complains -- no turn, so the ending
+  feels flat and the reader guesses it from the first words.
+* A meeting-about-a-meeting line (114ch) whose punchline repeats the
+  setup; the circle is the joke, leaving nothing for the ending.
+* A reply-all line (114ch) that leans on the most overused office joke
+  around and ends on a muddled clause.
 
-* A, printer (110ch): "The printer only jams on the page I need, on
-  the day I need it, in front of the one person I've been avoiding."
-  States a complaint plainly with no turn -- the ending is flat, and
-  the reader sees it coming from the first clause.
-* B, meeting-about-meeting (114ch): "We held a meeting to plan the
-  meeting about the meeting, and the only action item was to schedule
-  another meeting." The punchline restates the setup; the circular
-  repetition *is* the joke, so there is no surprise left for the end.
-* C, reply-all (114ch): "I hit reply-all to say 'please remove me
-  from this thread' and now seventy people are debating whether I
-  meant it." Reply-all is the most cliched office joke in circulation,
-  and the ending is convoluted -- "debating whether I meant it" lands
-  soft next to the fire drill's three-beat escalation.
+The kept line (116ch) wins on all three counts: one setup everyone
+recognises, one turn, and the punchline last.
 
-The kept line (116ch) wins on every criterion: one universal setup,
-one turn, a punchline last, every word earning its place.
-
-Output is written atomically (temporary file in the same directory,
-fsync, rename, directory fsync) with mode 0644, then read back and
-re-verified so a truncated or mistyped write is reported instead of
-silently shipped.
-
-Reviser notes (revision of the builder's first version):
-
-* ``os.write`` may write fewer bytes than requested -- a short write
-  the builder never checked for. Writes now loop until every byte is
-  out (``_write_all``), treat a zero-byte write as a failure, and
-  confirm the temporary file's size with ``fstat`` before the rename,
-  so a truncated write can no longer slip through.
-* ``resolve_output_dir`` used to hand any string straight to
-  ``makedirs``: a relative path silently wrote somewhere the caller
-  did not mean, a path blocked by an existing *file* died with a bare
-  error, and ``MAKEFUN_OUTPUT_DIR=/`` would have swept the root
-  directory's stale temporaries. It now normalises to an absolute
-  path, rejects the filesystem root outright, raises a clear error
-  when a file blocks the directory, and checks the directory is
-  actually writable before anything is written.
-* ``cleanup_stale_temporaries`` used to call ``unlink`` on anything
-  whose name matched the prefix -- including a directory, which it
-  then pointlessly retried three times with sleeps. It now scans with
-  ``os.scandir`` and only touches regular files.
-* ``verify_written_file`` used to compare bytes and mode only. It
-  now also checks the file size from ``stat`` first, decodes the
-  read-back bytes as UTF-8, and re-runs the full gate validation on
-  the *published* text -- so the file the scorer will read is checked
-  as published, not just the in-memory constant it was written from.
-* Failures now exit 1 with one ``error: ...`` line on stderr instead
-  of an unhandled traceback, while stdout stays silent so runs stay
-  byte-identical.
+Writing is careful rather than clever. The bytes go to a temporary
+file in the same directory, are flushed to disk, and only then take
+the place of ``entry.txt`` by rename, so a crash can never leave a
+half-written entry behind. The finished file is read back and checked
+again -- size, bytes, encoding, the character gate, and its mode --
+before the program reports success. Anything wrong exits 1 with a
+single ``error: ...`` line and nothing on stdout.
 """
 
 import os
@@ -76,99 +40,80 @@ import stat
 import sys
 import tempfile
 import time
+from pathlib import Path
 
-ENTRY = (
-    "The fire drill is the only meeting where everyone shows up on "
-    "time, leaves together, and nobody asks for the slides."
-)
+ENTRY_TEXT = "The fire drill is the only meeting where everyone shows up on time, leaves together, and nobody asks for the slides."
 
-# The gate allows 1 to 200 characters; keep the constant next to the
-# check so the two can never drift apart unnoticed.
-MIN_CHARS = 1
-MAX_CHARS = 200
-TARGET_NAME = "entry.txt"
-TARGET_MODE = 0o644
-# Stale ".entry-*" temporaries left by an interrupted earlier run are
-# swept before writing, with a bounded retry for a busy filesystem.
-STALE_TMP_PREFIX = ".entry-"
-STALE_CLEANUP_RETRIES = 3
-STALE_CLEANUP_DELAY_SECONDS = 0.05
-# Characters that would split the entry into more than one line, or
-# otherwise break the single-line rule, even though the sealed gate
-# (character count + not-whitespace-only) would not catch them.
-LINE_SEPARATORS = ("\u0085", "\u2028", "\u2029")
+MIN_LEN = 1
+MAX_LEN = 200
+OUT_NAME = "entry.txt"
+OUT_MODE = 0o644
+SCRAP_PREFIX = ".entry-"
+SCRAP_TRIES = 3
+SCRAP_PAUSE = 0.05
+BAD_SEPARATORS = ("\u0085", "\u2028", "\u2029")
 
 
-def resolve_output_dir():
-    """Return the directory that receives ``entry.txt``.
+def _writable_dir(raw_value):
+    """Turn the ``MAKEFUN_OUTPUT_DIR`` value into a directory to use.
 
-    ``MAKEFUN_OUTPUT_DIR`` wins when it names a non-blank directory;
-    a blank or whitespace-only value falls back to ``/output`` instead
-    of crashing on a relative or empty path. A relative value is
-    resolved against the current working directory and normalised to
-    an absolute path, so the write can never land somewhere the
-    caller did not mean. The filesystem root is rejected outright --
-    sweeping or writing there is never what a caller wants. The
-    directory is created (parents included) so the write never fails
-    on a missing folder; a path blocked by an existing file, or a
-    directory that is not writable, raises a clear error here instead
-    of failing halfway through the write.
+    A blank value means ``/output``. A relative value is read against
+    the working directory and made absolute, so output never lands
+    somewhere the caller did not intend. The filesystem root is
+    refused outright: sweeping or writing there is never wanted.
+    A path blocked by a plain file, or a directory that cannot be
+    written to, fails here with a plain message instead of halfway
+    through the write.
     """
-    raw = os.environ.get("MAKEFUN_OUTPUT_DIR") or ""
-    out_dir = raw.strip() or "/output"
-    if not os.path.isabs(out_dir):
-        out_dir = os.path.abspath(out_dir)
-    out_dir = os.path.normpath(out_dir)
-    if out_dir == os.path.abspath(os.sep):
-        raise ValueError("output directory must not be the filesystem root")
-    if os.path.lexists(out_dir) and not os.path.isdir(out_dir):
-        raise ValueError(
-            f"output directory {out_dir!r} is blocked by an existing file"
-        )
-    os.makedirs(out_dir, exist_ok=True)
-    if not os.path.isdir(out_dir):
-        raise ValueError(f"output path {out_dir!r} is not a directory")
-    if not os.access(out_dir, os.W_OK):
-        raise ValueError(f"output directory {out_dir!r} is not writable")
-    return out_dir
+    wanted = (raw_value or "").strip() or "/output"
+    if not os.path.isabs(wanted):
+        wanted = os.path.abspath(wanted)
+    wanted = os.path.normpath(wanted)
+    if wanted == os.path.abspath(os.sep):
+        raise ValueError("the filesystem root cannot be the output directory")
+    if os.path.lexists(wanted) and not os.path.isdir(wanted):
+        raise ValueError(f"a file blocks the output directory {wanted!r}")
+    os.makedirs(wanted, exist_ok=True)
+    if not os.path.isdir(wanted):
+        raise ValueError(f"{wanted!r} is not a directory after creation")
+    if not os.access(wanted, os.W_OK):
+        raise ValueError(f"the output directory {wanted!r} cannot be written to")
+    return Path(wanted)
 
 
-def validate_entry(text):
-    """Check the entry against the sealed scorer's gate -- and the
-    single-line rule the gate alone does not enforce.
+def _check_text(text):
+    """Check ``text`` against the gate and return it as UTF-8 bytes.
 
-    Raises ``ValueError`` with a specific message on the first problem
-    found, so a bad entry fails loudly here rather than producing an
-    invalid file: 1-200 characters, not only whitespace, free of
-    control characters (a stray newline, tab or DEL would break the
-    single-line rule), free of Unicode line separators, and with no
-    leading or trailing whitespace (padding would waste the tight
-    character budget and could be trimmed by a reader).
+    The gate allows 1 to 200 characters. On top of that the line must
+    be a single line: no control characters, no Unicode line
+    separators, and no padding at either end, since padding would eat
+    the budget and a reader might trim it. The first problem found
+    raises ``ValueError`` with a specific message.
     """
     if not isinstance(text, str):
-        raise ValueError("entry is not a string")
-    if not MIN_CHARS <= len(text) <= MAX_CHARS:
+        raise ValueError("the entry is not a string")
+    if not MIN_LEN <= len(text) <= MAX_LEN:
         raise ValueError(
-            f"entry is {len(text)} characters, gate needs "
-            f"{MIN_CHARS}-{MAX_CHARS}"
+            f"the entry is {len(text)} characters long, the gate allows "
+            f"{MIN_LEN}-{MAX_LEN}"
         )
     if not text.strip():
-        raise ValueError("entry is only whitespace")
+        raise ValueError("the entry is blank")
     if text != text.strip():
-        raise ValueError("entry has leading or trailing whitespace")
-    for ch in text:
-        code = ord(ch)
+        raise ValueError("the entry has padding at one end")
+    for char in text:
+        code = ord(char)
         if code < 0x20 or code == 0x7F:
-            raise ValueError(f"control character U+{code:04X} in entry text")
-        if ch in LINE_SEPARATORS:
-            raise ValueError(f"line separator U+{code:04X} in entry text")
+            raise ValueError(f"control character U+{code:04X} in the entry")
+        if char in BAD_SEPARATORS:
+            raise ValueError(f"line separator U+{code:04X} in the entry")
+    return text.encode("utf-8")
 
 
-def _fsync_dir(path):
-    """Flush a directory entry to disk; best effort on filesystems
-    that do not support directory fsync."""
+def _flush_directory(directory):
+    """Push a directory entry to disk; ignore filesystems that refuse."""
     try:
-        fd = os.open(path, os.O_RDONLY)
+        fd = os.open(directory, os.O_RDONLY)
     except OSError:
         return
     try:
@@ -179,148 +124,146 @@ def _fsync_dir(path):
         os.close(fd)
 
 
-def _remove_quietly(path):
-    """Delete a file if it exists; ignore the error if it is already
-    gone or otherwise cannot be removed."""
+def _drop_quietly(path):
+    """Delete ``path`` if it is there; ignore it if it is already gone."""
     try:
         os.unlink(path)
     except OSError:
         pass
 
 
-def cleanup_stale_temporaries(out_dir):
-    """Remove leftover ``.entry-*`` files from interrupted runs.
+def _sweep_scraps(directory):
+    """Clear leftover ``.entry-*`` files from interrupted earlier runs.
 
-    Only regular files are touched: a directory (or anything else)
-    that happens to share the prefix is left alone instead of being
-    retried pointlessly. Each candidate is retried a few times with a
-    short pause, because a just-killed sibling process may still hold
-    the file briefly. A file that still will not go away is left in
-    place: it is harmless (it never becomes ``entry.txt``) and must
-    not fail the run.
+    Only plain files are removed: a directory that happens to share
+    the prefix is left alone. Each file gets a few tries with a short
+    pause, in case a dying sibling process still holds it. A file that
+    will not go away stays where it is -- it can never become
+    ``entry.txt`` and must not fail the run.
     """
     try:
-        entries = list(os.scandir(out_dir))
+        entries = list(os.scandir(directory))
     except OSError:
         return
     for entry in entries:
-        if not entry.name.startswith(STALE_TMP_PREFIX):
+        if not entry.name.startswith(SCRAP_PREFIX):
             continue
         try:
             if not entry.is_file(follow_symlinks=False):
                 continue
         except OSError:
             continue
-        stale = entry.path
-        for _attempt in range(STALE_CLEANUP_RETRIES):
+        scrap = entry.path
+        for _ in range(SCRAP_TRIES):
             try:
-                os.unlink(stale)
+                os.unlink(scrap)
                 break
             except FileNotFoundError:
                 break
             except OSError:
-                time.sleep(STALE_CLEANUP_DELAY_SECONDS)
+                time.sleep(SCRAP_PAUSE)
         else:
-            _remove_quietly(stale)
+            _drop_quietly(scrap)
 
 
-def _write_all(fd, data):
-    """Write every byte of ``data`` to ``fd``.
+def _drain(fd, data):
+    """Push every byte of ``data`` into ``fd``.
 
-    A single ``os.write`` call may write fewer bytes than requested
-    (a short write); loop until the whole buffer is out. A write of
-    zero bytes with data still pending means the descriptor can make
-    no progress and is treated as a failure, not spun on forever.
-    Returns the number of bytes written.
+    One ``os.write`` call may accept fewer bytes than offered, so loop
+    until the buffer is empty. A call that accepts nothing while data
+    remains means no progress is possible and fails loudly instead of
+    spinning forever. Returns the byte count written.
     """
     view = memoryview(data)
-    written = 0
-    while written < len(data):
-        n = os.write(fd, view[written:])
-        if n == 0:
-            raise OSError("short write: os.write wrote 0 bytes")
-        written += n
-    return written
+    sent = 0
+    while sent < len(data):
+        count = os.write(fd, view[sent:])
+        if count == 0:
+            raise OSError("os.write accepted 0 bytes with data remaining")
+        sent += count
+    return sent
 
 
-def write_entry_atomic(out_dir, data):
-    """Write ``data`` to ``entry.txt`` atomically with mode 0644.
+class EntrySink:
+    """Writes the entry file for one output directory.
 
-    A temporary file is created in the same directory (so the rename
-    cannot cross filesystems), given mode 0644, written in full
-    (short writes looped over, size confirmed with ``fstat`` before
-    the rename), fsynced, and renamed over the target; the directory
-    is then fsynced so the rename itself is durable. On any failure
-    the temporary file is removed and the exception is re-raised.
+    ``publish`` writes the bytes to a temporary file next to the
+    target, flushes it, and renames it over ``entry.txt``; ``confirm``
+    then reads the finished file back and checks it as published.
     """
-    target = os.path.join(out_dir, TARGET_NAME)
-    fd, tmp_path = tempfile.mkstemp(prefix=STALE_TMP_PREFIX, dir=out_dir)
-    try:
+
+    def __init__(self, directory):
+        self.directory = Path(directory)
+        self.target = self.directory / OUT_NAME
+
+    def publish(self, data):
+        """Atomically replace ``entry.txt`` with ``data`` at mode 0644."""
+        fd, tmp_name = tempfile.mkstemp(prefix=SCRAP_PREFIX, dir=self.directory)
+        tmp_path = Path(tmp_name)
         try:
-            os.fchmod(fd, TARGET_MODE)
-            _write_all(fd, data)
-            if os.fstat(fd).st_size != len(data):
-                raise OSError(
-                    "temporary file size "
-                    f"{os.fstat(fd).st_size} != {len(data)} bytes written"
-                )
-            os.fsync(fd)
-        finally:
-            os.close(fd)
-        os.chmod(tmp_path, TARGET_MODE)
-        os.replace(tmp_path, target)
-        os.chmod(target, TARGET_MODE)
-        _fsync_dir(out_dir)
-    except BaseException:
-        _remove_quietly(tmp_path)
-        raise
-    return target
+            try:
+                os.fchmod(fd, OUT_MODE)
+                _drain(fd, data)
+                if os.fstat(fd).st_size != len(data):
+                    raise OSError(
+                        "temporary file holds "
+                        f"{os.fstat(fd).st_size} bytes, expected {len(data)}"
+                    )
+                os.fsync(fd)
+            finally:
+                os.close(fd)
+            os.chmod(tmp_path, OUT_MODE)
+            os.replace(tmp_path, self.target)
+            os.chmod(self.target, OUT_MODE)
+            _flush_directory(self.directory)
+        except BaseException:
+            _drop_quietly(tmp_path)
+            raise
+        return self.target
+
+    def confirm(self, data):
+        """Read ``entry.txt`` back and check size, bytes, gate and mode.
+
+        The size comes from ``stat`` first, then the bytes are
+        compared, then the read-back bytes are decoded and run through
+        the whole gate again -- so the file the scorer will read is the
+        file that gets checked, not the constant in memory. A wrong
+        mode fails too: the scorer runs as another user and must be
+        able to read the file.
+        """
+        info = os.stat(self.target)
+        if info.st_size != len(data):
+            raise ValueError(
+                f"entry.txt holds {info.st_size} bytes, expected {len(data)}"
+            )
+        with open(self.target, "rb") as handle:
+            back = handle.read()
+        if back != data:
+            raise ValueError("entry.txt does not match what was written")
+        try:
+            published = back.decode("utf-8")
+        except UnicodeDecodeError as exc:
+            raise ValueError(f"entry.txt cannot be decoded as UTF-8: {exc}") from exc
+        _check_text(published)
+        mode = stat.S_IMODE(info.st_mode)
+        if mode != OUT_MODE:
+            raise ValueError(f"entry.txt mode is {mode:04o}, wanted 0644")
 
 
-def verify_written_file(target, data):
-    """Read the finished file back and confirm size, bytes, gate and
-    mode -- on the published file, not the in-memory constant.
-
-    The size is checked from ``stat`` first (a cheap short-write
-    detector), then the bytes are compared, then the read-back bytes
-    are decoded as UTF-8 and the full gate validation is re-run on
-    that decoded text, so a truncation, a mistyped write or an
-    encoding slip is raised instead of reported as success. A wrong
-    mode means the file would not be readable where the scorer runs
-    it; that is raised too.
-    """
-    info = os.stat(target)
-    if info.st_size != len(data):
-        raise ValueError(
-            f"entry.txt is {info.st_size} bytes, expected {len(data)}"
-        )
-    with open(target, "rb") as fh:
-        back = fh.read()
-    if back != data:
-        raise ValueError("read-back verification failed")
-    try:
-        published = back.decode("utf-8")
-    except UnicodeDecodeError as exc:
-        raise ValueError(f"entry.txt is not valid UTF-8: {exc}") from exc
-    validate_entry(published)
-    mode = stat.S_IMODE(info.st_mode)
-    if mode != TARGET_MODE:
-        raise ValueError(f"entry.txt mode is {mode:04o}, expected 0644")
-
-
-def main():
-    out_dir = resolve_output_dir()
-    cleanup_stale_temporaries(out_dir)
-    validate_entry(ENTRY)
-    data = ENTRY.encode("utf-8")
-    target = write_entry_atomic(out_dir, data)
-    verify_written_file(target, data)
+def run():
+    """Write the entry and confirm it; 0 on success."""
+    directory = _writable_dir(os.environ.get("MAKEFUN_OUTPUT_DIR"))
+    _sweep_scraps(directory)
+    data = _check_text(ENTRY_TEXT)
+    sink = EntrySink(directory)
+    sink.publish(data)
+    sink.confirm(data)
     return 0
 
 
 if __name__ == "__main__":
     try:
-        sys.exit(main())
-    except Exception as exc:  # noqa: BLE001 - report, then exit 1
+        sys.exit(run())
+    except Exception as exc:  # noqa: BLE001 - one line on stderr, then exit 1
         print(f"error: {exc}", file=sys.stderr)
         sys.exit(1)
